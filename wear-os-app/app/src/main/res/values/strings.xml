@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Galaxy Mac Control</string>
+    <string name="connecting">Searching for Mac...</string>
+    <string name="connected">Connected to Mac</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="air_mouse_mode">Air Mouse Active</string>
+    <string name="touchpad_mode">Touchpad Active</string>
+    <string name="left_click_gesture">Pinch: Left Click</string>
+    <string name="right_click_gesture">Double Fist: Right Click</string>
+    <string name="drag_gesture">Fist: Grab &amp; Hold</string>
+    <string name="scroll_gesture">Wrist Roll: 3D Scroll</string>
+</resources>
