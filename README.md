@@ -4,6 +4,10 @@
 [![Language](https://img.shields.io/badge/Language-Kotlin%20%7C%20Python-blue.svg?style=flat)](https://github.com/Happy123455/GalaxyMacController)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+<p align="center">
+  <img src="assets/infographic.jpg" alt="Galaxy Watch 8 Classic to MacBook Air Infographic" width="100%">
+</p>
+
 Transform your **Samsung Galaxy Watch** (Wear OS 4 / 5 / Galaxy Watch 4, 5, 6, 7, 8 Ultra/Classic) into a high-precision, low-latency **Air Controller & Spatial Mouse** for your **Mac**.
 
 Built with real-time IMU sensor fusion, DSP anti-tremor filtering, macOS Accessibility magnetic button snapping, physical bezel rotary wheel decoding, and wrist-twist 3D scrolling.
