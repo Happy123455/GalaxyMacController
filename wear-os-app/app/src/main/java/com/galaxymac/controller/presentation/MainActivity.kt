@@ -95,7 +95,7 @@ class MainActivity : ComponentActivity() {
         hapticManager = HapticManager(this)
         bleHidManager = BleHidManager(this)
         val coroutineScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main)
-        udpClient = UdpClient(coroutineScope)
+        udpClient = UdpClient(this, coroutineScope, appSettings)
         gestureEngine = GestureEngine(this, udpClient, hapticManager, appSettings, coroutineScope, bleHidManager)
 
         udpClient.start()
@@ -227,20 +227,14 @@ fun MainAppScreen(
         CurrentScreen.TOUCHPAD -> TouchpadScreen(
             onDrag = { dx, dy ->
                 udpClient.sendPacket(ControlPacket.Move(dx * 2.5f, dy * 2.5f))
-                if (bleHidManager.isConnected.value) {
+                if (bleHidManager.isConnected.value && !udpClient.isLinked()) {
                     val bDx = (dx * 2.0f).toInt().coerceIn(-127, 127).toByte()
                     val bDy = (dy * 2.0f).toInt().coerceIn(-127, 127).toByte()
                     bleHidManager.sendMouseMove(bDx, bDy)
                 }
             },
-            onLeftClick = {
-                gestureEngine.triggerManualClick("left")
-                if (bleHidManager.isConnected.value) bleHidManager.sendLeftClick()
-            },
-            onRightClick = {
-                gestureEngine.triggerManualClick("right")
-                if (bleHidManager.isConnected.value) bleHidManager.sendRightClick()
-            },
+            onLeftClick = { gestureEngine.triggerManualClick("left") },
+            onRightClick = { gestureEngine.triggerManualClick("right") },
             onExitTouchpad = { screen = CurrentScreen.MAIN }
         )
     }
@@ -258,6 +252,7 @@ fun MainDashboard(
 ) {
     val connectionStatus by udpClient.connectionStatus.collectAsState()
     val serverInfo by udpClient.targetServerInfo.collectAsState()
+    val networkInfo by udpClient.networkInfo.collectAsState()
     val activeGesture by gestureEngine.activeGesture.collectAsState()
     val isAirMouseActive by gestureEngine.isAirMouseActive.collectAsState()
     val isAiming by gestureEngine.isAimingMode.collectAsState()
@@ -342,7 +337,7 @@ fun MainDashboard(
                     }
                 )
 
-                ConnectionBadge(status = connectionStatus, info = serverInfo)
+                ConnectionBadge(status = connectionStatus, info = serverInfo, network = networkInfo)
 
                 GestureIndicator(gesture = activeGesture, isAiming = isAiming, gestureClicksOn = gestureClicksOn)
 
@@ -772,6 +767,8 @@ fun SensitivitySettingsScreen(
     val aimingSpeed by appSettings.aimingSpeed.collectAsState()
     val horizSens by appSettings.horizontalSensitivity.collectAsState()
     val vertSens by appSettings.verticalSensitivity.collectAsState()
+    val tiltComp by appSettings.tiltCompensation.collectAsState()
+    val invertRoll by appSettings.invertRollScroll.collectAsState()
 
     val scrollState = rememberScrollState()
 
@@ -822,6 +819,22 @@ fun SensitivitySettingsScreen(
                 label = { Text("Vertical: ${"%.2f".format(vertSens)}x", fontSize = 10.sp, color = Color.White) }
             )
 
+            Chip(
+                modifier = Modifier.fillMaxWidth(0.92f),
+                onClick = { appSettings.setTiltCompensation(!tiltComp) },
+                colors = ChipDefaults.chipColors(backgroundColor = Color(0xFF1F2428)),
+                label = { Text("Tilt Compensation: ${if (tiltComp) "ON" else "OFF"}", fontSize = 10.sp, color = Color.White) },
+                secondaryLabel = { Text("Straight aiming with a turned wrist", fontSize = 8.sp, color = Color.Gray) }
+            )
+
+            Chip(
+                modifier = Modifier.fillMaxWidth(0.92f),
+                onClick = { appSettings.setInvertRollScroll(!invertRoll) },
+                colors = ChipDefaults.chipColors(backgroundColor = Color(0xFF1F2428)),
+                label = { Text("Twist Scroll: ${if (invertRoll) "Inverted" else "Normal"}", fontSize = 10.sp, color = Color.White) },
+                secondaryLabel = { Text("Flip if wrist twist scrolls the wrong way", fontSize = 8.sp, color = Color.Gray) }
+            )
+
             Button(
                 modifier = Modifier.fillMaxWidth(0.7f).height(32.dp),
                 onClick = onBack,
@@ -836,10 +849,10 @@ fun SensitivitySettingsScreen(
 }
 
 @Composable
-fun ConnectionBadge(status: ConnectionStatus, info: String) {
+fun ConnectionBadge(status: ConnectionStatus, info: String, network: String) {
     val (dotColor, text, subtext) = when (status) {
         ConnectionStatus.CONNECTED -> Triple(Color(0xFF00E676), "Connected", info)
-        ConnectionStatus.SEARCHING -> Triple(Color(0xFFFFD600), "Searching Mac...", "Ensure Mac server is running")
+        ConnectionStatus.SEARCHING -> Triple(Color(0xFFFFD600), "Searching Mac...", "Link: $network")
         ConnectionStatus.DISCONNECTED -> Triple(Color(0xFFFF5252), "Offline", "Starting...")
     }
 
@@ -859,9 +872,7 @@ fun ConnectionBadge(status: ConnectionStatus, info: String) {
         )
         Column {
             Text(text = text, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            if (status == ConnectionStatus.CONNECTED) {
-                Text(text = subtext, fontSize = 7.sp, color = Color.LightGray)
-            }
+            Text(text = subtext, fontSize = 7.sp, color = Color.LightGray)
         }
     }
 }

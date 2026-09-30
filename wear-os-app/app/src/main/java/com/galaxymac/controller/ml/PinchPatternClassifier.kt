@@ -43,7 +43,11 @@ class PinchPatternClassifier {
     fun pushWaveformSample(magnitude: Float) {
         waveformBuffer[waveformHead] = magnitude
         waveformHead = (waveformHead + 1) % waveformSize
-        waveformUpdateTrigger.value = System.currentTimeMillis()
+        // Redraw the graph at most ~30 fps
+        val now = System.currentTimeMillis()
+        if (now - waveformUpdateTrigger.value >= 33L) {
+            waveformUpdateTrigger.value = now
+        }
     }
 
     fun getRecentWaveformSnapshot(): List<Float> {

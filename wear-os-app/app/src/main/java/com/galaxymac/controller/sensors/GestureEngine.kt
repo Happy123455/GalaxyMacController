@@ -5,6 +5,8 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import com.galaxymac.controller.bluetooth.BleHidManager
@@ -17,12 +19,13 @@ import com.galaxymac.controller.network.UdpClient
 import com.galaxymac.controller.settings.AppSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 class GestureEngine(
@@ -39,7 +42,12 @@ class GestureEngine(
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private val linearAccSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
-    private val rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    private val gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+
+    // All sensor processing and gesture state lives on this thread, off the UI thread.
+    private var sensorThread: HandlerThread? = null
+    private var sensorHandler: Handler? = null
+    private var isRunning = false
 
     private val _activeGesture = MutableStateFlow(ActiveGesture.NONE)
     val activeGesture: StateFlow<ActiveGesture> = _activeGesture
@@ -52,29 +60,51 @@ class GestureEngine(
     // ML Pattern Classifier instance
     val classifier = PinchPatternClassifier()
 
-    // Live sensor values for telemetry
+    // Live sensor values for telemetry (throttled to ~20 Hz so the UI isn't flooded)
     val liveGx = MutableStateFlow(0.0f)
     val liveGy = MutableStateFlow(0.0f)
     val liveGz = MutableStateFlow(0.0f)
     val liveAcc = MutableStateFlow(0.0f)
+    private var lastTelemetryMs = 0L
+    private var lastAccTelemetryMs = 0L
 
     // Calibration states
-    var isCalibratingPinch: Boolean = false
-    var isCalibratingFist: Boolean = false
+    @Volatile var isCalibratingPinch: Boolean = false
+    @Volatile var isCalibratingFist: Boolean = false
     val calibrationStatus = MutableStateFlow("Ready")
 
-    // Anti-Shake Motion Freeze timestamp (locks cursor during bezel scroll, pinch, double pinch, triple pinch)
-    private var motionFreezeUntil: Long = 0L
-    private var smoothX = 0.0f
-    private var smoothY = 0.0f
+    // Cursor freeze (locks cursor during bezel scroll and pinches so clicks land where you aimed)
+    @Volatile private var motionFreezeUntil: Long = 0L
 
-    // Multi-Pinch counter state machine & physical debounce lockout
+    // ---------------- Pointer state ----------------
+    private val pointerFilter = PointerFilter()
+    private var lastGyroTsNs = 0L
+    private var biasX = 0f
+    private var biasY = 0f
+    private var biasZ = 0f
+    private var stillSinceNs = 0L
+    private var pendingDx = 0f
+    private var pendingDy = 0f
+    private var lastFlushNs = 0L
+    private var bleResidualX = 0f
+    private var bleResidualY = 0f
+    /** Slow average of rotation speed, used to reject "taps" that are really arm swings. */
+    private var armSpeedSlow = 0f
+
+    // Gravity ("up" in device coordinates) for tilt compensation and wrist-twist scrolling
+    private val up = floatArrayOf(0f, 0f, 1f)
+    private var hasGravity = false
+
+    // ---------------- Pinch state ----------------
+    private val accLowPass = FloatArray(3)
+    private var lastAccTsNs = 0L
+    private var accSampleCounter = 0
     private var pinchCounter: Int = 0
-    private var pendingPinchJob: Job? = null
-    private val MULTI_PINCH_WINDOW_MS = 380L
     private var lastSinglePinchTime: Long = 0L
     private var lastPinchAcceptedTime: Long = 0L
-    private val MIN_INTER_PINCH_INTERVAL_MS = 160L // Physical debounce: eliminates flesh/strap recoil ringing!
+    private var firstPinchPeak = 0f
+    private val resolvePinchRunnable = Runnable { resolveMultiPinch() }
+    private val resetTrainingCounterRunnable = Runnable { pinchCounter = 0 }
 
     // Real-Time Gesture Review & Inspection State
     val lastReviewedGesture = MutableStateFlow("None")
@@ -83,28 +113,49 @@ class GestureEngine(
     val lastReviewedInterval = MutableStateFlow(0L)
     val isReviewReady = MutableStateFlow(false)
 
-    // Pulse tracking
+    // Pulse tracking (sensor timestamps, ms)
     private var pulseStartTime: Long = 0L
     private var isPulseActive: Boolean = false
     private var maxPulseMagnitude: Float = 0.0f
     private var lastGestureTime: Long = 0L
     private var lastShakeTime: Long = 0L
 
-    var isSelecting: Boolean = false
+    @Volatile var isSelecting: Boolean = false
         private set
 
-    // Roll calibration
-    private var calibratedRollAngle: Float = 0.0f
+    // Wrist twist (roll) scrolling
+    @Volatile private var calibratedRollAngle: Float = 0.0f
     private var isRollCalibrated: Boolean = false
-    private var currentRollAngle: Float = 0.0f
+    @Volatile private var currentRollAngle: Float = 0.0f
     private var lastScrollSentTime: Long = 0
 
-    // Rate limiting (60Hz max)
-    private var lastMovePacketTime: Long = 0
-    private val MOVE_PACKET_INTERVAL_NS = 16_000_000L // ~60fps
-    private val DEADZONE_THRESHOLD = 0.012f
-    private val AIMING_SPEED_THRESHOLD = 0.15f // rad/s
-    private val WRIST_ROLL_DEADZONE_DEG = 14.0f
+    private companion object {
+        const val SENSOR_PERIOD_US = 5_000          // 200 Hz gyro + accelerometer
+        const val GRAVITY_PERIOD_US = 10_000        // 100 Hz
+        const val FLUSH_INTERVAL_NS = 8_000_000L    // send cursor updates at ~125 Hz
+        const val PX_PER_RAD_PER_SPEED_UNIT = 62.5f // keeps the old speed-setting scale (1 unit = 1 px per 16 ms per rad/s)
+
+        // Pointer acceleration curve: below SLOW the aiming gain applies, above FAST the normal gain
+        const val GAIN_SLOW_RAD_S = 0.10f
+        const val GAIN_FAST_RAD_S = 1.00f
+        const val AIMING_INDICATOR_RAD_S = 0.20f
+        const val NOISE_FLOOR_RAD_S = 0.006f
+
+        // Gyro bias tracking (TYPE_GYROSCOPE is already calibrated; this only removes residual drift)
+        const val STILL_RAD_S = 0.035f
+        const val STILL_TIME_NS = 400_000_000L
+        const val BIAS_RATE = 0.004f
+
+        // Pinch detection
+        const val ACC_HIGH_PASS_HZ = 4.0f
+        const val MAX_ARM_SPEED_FOR_TAP = 2.2f      // rad/s; faster than this is arm motion, not a pinch
+        const val MIN_INTER_PINCH_INTERVAL_MS = 140L // physical debounce against flesh/strap recoil
+        const val MAX_PINCH_PULSE_MS = 110L
+        const val SHAKE_THRESHOLD = 17.5f
+
+        const val WRIST_ROLL_DEADZONE_DEG = 14.0f
+        const val WRIST_ROLL_RECENTER_DEG = 8.0f
+    }
 
     init {
         hapticManager.isEnabled = appSettings.vibrationEnabled.value
@@ -118,21 +169,32 @@ class GestureEngine(
     }
 
     fun start() {
-        gyroSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        linearAccSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        rotationVectorSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        Log.i(TAG, "Gesture Engine started.")
+        if (isRunning) return
+        isRunning = true
+        val thread = HandlerThread("GestureSensors", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
+        val handler = Handler(thread.looper)
+        sensorThread = thread
+        sensorHandler = handler
+
+        lastGyroTsNs = 0L
+        lastAccTsNs = 0L
+        pointerFilter.reset()
+
+        gyroSensor?.let { sensorManager.registerListener(this, it, SENSOR_PERIOD_US, handler) }
+        linearAccSensor?.let { sensorManager.registerListener(this, it, SENSOR_PERIOD_US, handler) }
+        gravitySensor?.let { sensorManager.registerListener(this, it, GRAVITY_PERIOD_US, handler) }
+        Log.i(TAG, "Gesture Engine started (gravity sensor: ${gravitySensor != null}).")
     }
 
     fun stop() {
+        if (!isRunning) return
+        isRunning = false
         sensorManager.unregisterListener(this)
-        pendingPinchJob?.cancel()
+        sensorHandler?.removeCallbacksAndMessages(null)
+        sensorThread?.quitSafely()
+        sensorThread = null
+        sensorHandler = null
+        pinchCounter = 0
         if (isSelecting) {
             endSelection()
         }
@@ -171,91 +233,287 @@ class GestureEngine(
         when (event.sensor.type) {
             Sensor.TYPE_GYROSCOPE -> handleGyroscope(event)
             Sensor.TYPE_LINEAR_ACCELERATION -> handleLinearAcceleration(event)
-            Sensor.TYPE_ROTATION_VECTOR -> handleRotationVector(event)
+            Sensor.TYPE_GRAVITY -> handleGravity(event)
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+    /** BLE HID is only a fallback: sending over both links would move/click the Mac twice. */
+    private fun bleActive(): Boolean = bleHidManager.isConnected.value && !udpClient.isLinked()
+
+    // =====================================================================
+    // Pointer
+    // =====================================================================
+
     /**
-     * Gyroscope handler with intelligent "About to Click" (Aiming Mode) slowdown
-     * and anti-jitter pre-click freezing.
+     * Integrates angular velocity over the real sample interval and maps it through a
+     * smooth pointer-acceleration curve: slow, deliberate motion gets the precise
+     * "aiming" gain, fast sweeps get the normal gain, with no hard switch in between.
      */
     private fun handleGyroscope(event: SensorEvent) {
+        val tsNs = event.timestamp
+        val prevTs = lastGyroTsNs
+        lastGyroTsNs = tsNs
+        if (prevTs == 0L) return
+        val dt = ((tsNs - prevTs) / 1e9f).coerceIn(0.0005f, 0.05f)
+
+        // 1. Remove residual gyro bias while the hand is perfectly still
         val gx = event.values[0]
         val gy = event.values[1]
         val gz = event.values[2]
+        val cx = gx - biasX
+        val cy = gy - biasY
+        val cz = gz - biasZ
+        val mag = sqrt(cx * cx + cy * cy + cz * cz)
+        if (mag < STILL_RAD_S) {
+            if (stillSinceNs == 0L) stillSinceNs = tsNs
+            if (tsNs - stillSinceNs > STILL_TIME_NS) {
+                biasX += BIAS_RATE * (gx - biasX)
+                biasY += BIAS_RATE * (gy - biasY)
+                biasZ += BIAS_RATE * (gz - biasZ)
+            }
+        } else {
+            stillSinceNs = 0L
+        }
+        armSpeedSlow += (dt / (0.15f + dt)) * (mag - armSpeedSlow)
 
-        liveGx.value = gx
-        liveGy.value = gy
-        liveGz.value = gz
+        val nowMs = SystemClock.uptimeMillis()
+        if (nowMs - lastTelemetryMs > 50) {
+            lastTelemetryMs = nowMs
+            liveGx.value = cx
+            liveGy.value = cy
+            liveGz.value = cz
+        }
 
         if (!_isAirMouseActive.value) return
 
-        val nowMs = SystemClock.uptimeMillis()
+        // 2. Map body rotation to screen axes
+        val (rawX, rawY) = mapToScreenAxes(cx, cy, cz)
+
+        // 3. Speed-adaptive smoothing (kills tremor when slow, no lag when fast)
+        pointerFilter.filter(rawX, rawY, dt)
+
         if (nowMs < motionFreezeUntil) {
-            smoothX = 0.0f
-            smoothY = 0.0f
+            pendingDx = 0f
+            pendingDy = 0f
             return
         }
 
-        val nowNs = event.timestamp
-        if (nowNs - lastMovePacketTime < MOVE_PACKET_INTERVAL_NS) return
-        lastMovePacketTime = nowNs
+        val speed = pointerFilter.speed
+        val aiming = speed < AIMING_INDICATOR_RAD_S
+        if (isAimingMode.value != aiming) isAimingMode.value = aiming
 
-        val rawX = -gz
-        val rawY = when (appSettings.verticalAxisMode.value) {
-            0 -> -gx
-            1 -> -gy
-            2 -> gx
-            3 -> gy
-            else -> -gy
+        // 4. Remove the sensor noise floor without a hard deadzone that eats fine movements
+        var fx = pointerFilter.x
+        var fy = pointerFilter.y
+        val fMag = sqrt(fx * fx + fy * fy)
+        if (fMag <= NOISE_FLOOR_RAD_S) {
+            fx = 0f
+            fy = 0f
+        } else {
+            val scale = (fMag - NOISE_FLOOR_RAD_S) / fMag
+            fx *= scale
+            fy *= scale
         }
 
-        val rawSpeed = sqrt(rawX * rawX + rawY * rawY)
-        val aiming = rawSpeed < AIMING_SPEED_THRESHOLD
-        isAimingMode.value = aiming
+        // 5. Pointer acceleration curve (smoothstep between aiming and normal gain)
+        val lowGain = appSettings.aimingSpeed.value * PX_PER_RAD_PER_SPEED_UNIT
+        val highGain = appSettings.normalSpeed.value * PX_PER_RAD_PER_SPEED_UNIT
+        val t = ((speed - GAIN_SLOW_RAD_S) / (GAIN_FAST_RAD_S - GAIN_SLOW_RAD_S)).coerceIn(0f, 1f)
+        val gain = lowGain + (highGain - lowGain) * (t * t * (3f - 2f * t))
 
-        val targetX = if (abs(rawX) > DEADZONE_THRESHOLD) rawX else 0.0f
-        val targetY = if (abs(rawY) > DEADZONE_THRESHOLD) rawY else 0.0f
+        pendingDx += fx * dt * gain * appSettings.horizontalSensitivity.value
+        pendingDy += fy * dt * gain * appSettings.verticalSensitivity.value
 
-        val alpha = if (aiming) 0.85f else 0.65f
-        smoothX = smoothX * (1f - alpha) + targetX * alpha
-        smoothY = smoothY * (1f - alpha) + targetY * alpha
+        // 6. Send at a steady rate; sub-pixel remainders keep accumulating
+        if (tsNs - lastFlushNs >= FLUSH_INTERVAL_NS) {
+            lastFlushNs = tsNs
+            flushPointer()
+        }
+    }
 
-        if (abs(smoothX) < 0.003f && abs(smoothY) < 0.003f) return
-
-        val baseSpeed = if (aiming) appSettings.aimingSpeed.value else appSettings.normalSpeed.value
-        val horizSens = appSettings.horizontalSensitivity.value
-        val vertSens = appSettings.verticalSensitivity.value
-
-        val dx = smoothX * baseSpeed * horizSens
-        val dy = smoothY * baseSpeed * vertSens
+    private fun flushPointer() {
+        val dx = pendingDx
+        val dy = pendingDy
+        if (abs(dx) < 0.01f && abs(dy) < 0.01f) return
+        pendingDx = 0f
+        pendingDy = 0f
 
         udpClient.sendPacket(ControlPacket.Move(dx, dy))
 
-        if (bleHidManager.isConnected.value) {
-            val bDx = dx.toInt().coerceIn(-127, 127).toByte()
-            val bDy = dy.toInt().coerceIn(-127, 127).toByte()
-            if (bDx != 0.toByte() || bDy != 0.toByte()) {
-                bleHidManager.sendMouseMove(bDx, bDy)
+        if (bleActive()) {
+            bleResidualX += dx
+            bleResidualY += dy
+            val bx = bleResidualX.roundToInt().coerceIn(-127, 127)
+            val by = bleResidualY.roundToInt().coerceIn(-127, 127)
+            if (bx != 0 || by != 0) {
+                bleResidualX -= bx
+                bleResidualY -= by
+                bleHidManager.sendMouseMove(bx.toByte(), by.toByte())
             }
         }
     }
 
     /**
-     * Linear acceleration handler with physical recoil debounce
+     * Returns (horizontal, vertical) angular velocity in "screen" terms.
+     *
+     * With tilt compensation, horizontal motion is rotation around the real-world vertical
+     * and vertical motion is rotation around the horizontal axis across the forearm, so
+     * aiming stays straight even when the wrist is turned (e.g. palm facing sideways).
+     */
+    private fun mapToScreenAxes(cx: Float, cy: Float, cz: Float): Pair<Float, Float> {
+        val mode = appSettings.verticalAxisMode.value
+        val legacyY = when (mode) {
+            0 -> -cx
+            1 -> -cy
+            2 -> cx
+            3 -> cy
+            else -> -cy
+        }
+        if (!hasGravity || !appSettings.tiltCompensation.value) {
+            return Pair(-cz, legacyY)
+        }
+
+        // Modes 1/3 pitch around device Y, so the forearm runs along device X (modes 0/2: along Y).
+        // Pitch axis = up × forearm (forearm on X) or forearm × up (forearm on Y);
+        // both reduce to the legacy +Y / +X axis when the watch face points straight up.
+        val forearmAlongX = mode == 1 || mode == 3
+        var px = if (forearmAlongX) 0f else up[2]
+        var py = if (forearmAlongX) up[2] else 0f
+        var pz = if (forearmAlongX) -up[1] else -up[0]
+        val pLen = sqrt(px * px + py * py + pz * pz)
+        if (pLen < 0.35f) {
+            // Forearm is pointing almost straight up/down: pitch axis is undefined, fall back
+            return Pair(-cz, legacyY)
+        }
+        px /= pLen; py /= pLen; pz /= pLen
+
+        val yaw = cx * up[0] + cy * up[1] + cz * up[2]
+        val pitch = cx * px + cy * py + cz * pz
+        val sign = if (mode == 0 || mode == 1) -1f else 1f
+        return Pair(-yaw, sign * pitch)
+    }
+
+    // =====================================================================
+    // Gravity: tilt compensation + wrist twist scrolling
+    // =====================================================================
+
+    private fun handleGravity(event: SensorEvent) {
+        val x = event.values[0]
+        val y = event.values[1]
+        val z = event.values[2]
+        val norm = sqrt(x * x + y * y + z * z)
+        if (norm < 1f) return
+        up[0] = x / norm
+        up[1] = y / norm
+        up[2] = z / norm
+        hasGravity = true
+
+        handleWristRoll(x, y, z)
+    }
+
+    /**
+     * Wrist twist = rotation around the forearm. This is deliberately a different axis
+     * from vertical pointing, so aiming up/down never triggers scrolling.
+     */
+    private fun handleWristRoll(x: Float, y: Float, z: Float) {
+        val forearmAlongX = appSettings.verticalAxisMode.value.let { it == 1 || it == 3 }
+        val side = if (forearmAlongX) y else -x
+        // Arm pointing near vertical: twist angle is meaningless
+        if (sqrt(side * side + z * z) < 3.0f) return
+        val rollDeg = Math.toDegrees(atan2(side, z).toDouble()).toFloat()
+        currentRollAngle = rollDeg
+
+        if (!appSettings.wristRollScrollEnabled.value) {
+            if (_activeGesture.value == ActiveGesture.WRIST_ROLL_SCROLLING) {
+                _activeGesture.value = ActiveGesture.NONE
+            }
+            return
+        }
+
+        if (!isRollCalibrated) {
+            calibratedRollAngle = rollDeg
+            isRollCalibrated = true
+        }
+
+        val deltaRoll = currentRollAngle - calibratedRollAngle
+        val now = SystemClock.uptimeMillis()
+
+        // Re-center neutral baseline when the wrist rests near center
+        if (abs(deltaRoll) <= WRIST_ROLL_RECENTER_DEG) {
+            calibratedRollAngle = calibratedRollAngle * 0.98f + currentRollAngle * 0.02f
+            if (_activeGesture.value == ActiveGesture.WRIST_ROLL_SCROLLING) {
+                _activeGesture.value = ActiveGesture.NONE
+            }
+            return
+        }
+
+        if (abs(deltaRoll) > WRIST_ROLL_DEADZONE_DEG) {
+            if (now - lastScrollSentTime >= 40) {
+                lastScrollSentTime = now
+
+                // Clockwise twist scrolls DOWN, anti-clockwise scrolls UP (invertible in settings).
+                // Quadratic ramp: small twists scroll gently, big twists scroll fast.
+                val excess = (abs(deltaRoll) - WRIST_ROLL_DEADZONE_DEG).coerceAtMost(30f)
+                val magnitude = (excess * 1.2f + excess * excess * 0.09f).coerceAtMost(90f)
+                var scrollY = if (deltaRoll > 0) -magnitude else magnitude
+                if (appSettings.invertRollScroll.value) scrollY = -scrollY
+
+                _activeGesture.value = ActiveGesture.WRIST_ROLL_SCROLLING
+                udpClient.sendPacket(ControlPacket.Scroll(scrollX = 0.0f, scrollY = scrollY))
+                if (bleActive()) {
+                    val wheel = if (scrollY > 0) 1.toByte() else (-1).toByte()
+                    bleHidManager.sendScroll(wheel)
+                }
+            }
+        } else {
+            if (_activeGesture.value == ActiveGesture.WRIST_ROLL_SCROLLING) {
+                _activeGesture.value = ActiveGesture.NONE
+            }
+        }
+    }
+
+    // =====================================================================
+    // Pinch / fist / shake detection
+    // =====================================================================
+
+    /**
+     * Pinch taps are short, high-frequency transients. Arm movement is low frequency, so the
+     * acceleration is high-pass filtered first and taps during fast arm swings are rejected.
      */
     private fun handleLinearAcceleration(event: SensorEvent) {
         val ax = event.values[0]
         val ay = event.values[1]
         val az = event.values[2]
 
-        val magnitude = sqrt(ax * ax + ay * ay + az * az)
-        liveAcc.value = magnitude
-        classifier.pushWaveformSample(magnitude)
+        val tsNs = event.timestamp
+        val dt = if (lastAccTsNs == 0L) 0.005f else ((tsNs - lastAccTsNs) / 1e9f).coerceIn(0.0005f, 0.05f)
+        lastAccTsNs = tsNs
+        val rc = 1f / (2f * Math.PI.toFloat() * ACC_HIGH_PASS_HZ)
+        val a = dt / (rc + dt)
+        accLowPass[0] += a * (ax - accLowPass[0])
+        accLowPass[1] += a * (ay - accLowPass[1])
+        accLowPass[2] += a * (az - accLowPass[2])
+        val hx = ax - accLowPass[0]
+        val hy = ay - accLowPass[1]
+        val hz = az - accLowPass[2]
 
-        val now = SystemClock.uptimeMillis()
+        val rawMagnitude = sqrt(ax * ax + ay * ay + az * az)
+        val magnitude = sqrt(hx * hx + hy * hy + hz * hz)
+
+        // Waveform buffer at 100 Hz: 60 samples = 600 ms, matching the Mac studio window
+        accSampleCounter++
+        if (accSampleCounter % 2 == 0) {
+            classifier.pushWaveformSample(magnitude)
+        }
+        val uiNow = SystemClock.uptimeMillis()
+        if (uiNow - lastAccTelemetryMs > 50) {
+            lastAccTelemetryMs = uiNow
+            liveAcc.value = magnitude
+        }
+
+        val now = tsNs / 1_000_000L
 
         // 1. Quick Calibration Recording
         if (isCalibratingPinch) {
@@ -281,7 +539,7 @@ class GestureEngine(
         }
 
         // 0. Violent Shake Detection for Grab / Hold / Drag Toggle
-        if (magnitude >= 17.5f) {
+        if (rawMagnitude >= SHAKE_THRESHOLD && !isPulseActive) {
             if (now - lastShakeTime > 800L) {
                 lastShakeTime = now
                 freezeCursorMotion(400L)
@@ -294,31 +552,34 @@ class GestureEngine(
         val pinchThresh = appSettings.pinchThreshold.value
         val fistThresh = appSettings.fistThreshold.value
 
-        // 2. Pulse Start & Pre-Click Motion Lock
+        // Early freeze: stop the cursor as soon as a tap starts building, before it crosses
+        // the threshold, so the tap's own jolt doesn't nudge the pointer off target.
+        if (magnitude > pinchThresh * 0.6f && armSpeedSlow < MAX_ARM_SPEED_FOR_TAP) {
+            freezeCursorMotion(150L)
+        }
+
+        // 2. Pulse Start
         if (magnitude > pinchThresh) {
             if (!isPulseActive) {
+                if (armSpeedSlow > MAX_ARM_SPEED_FOR_TAP) return // arm swing, not a pinch
                 isPulseActive = true
                 pulseStartTime = now
                 maxPulseMagnitude = magnitude
                 freezeCursorMotion(240L)
-            } else {
-                if (magnitude > maxPulseMagnitude) {
-                    maxPulseMagnitude = magnitude
-                }
+            } else if (magnitude > maxPulseMagnitude) {
+                maxPulseMagnitude = magnitude
             }
         }
 
-        // 3. Pulse Finish & Duration Separation with Physical Debounce
-        if (isPulseActive && (magnitude <= pinchThresh * 0.70f || (now - pulseStartTime) > 220L)) {
+        // 3. Pulse Finish (hysteresis at 50%) & Duration Separation with Physical Debounce
+        if (isPulseActive && (magnitude <= pinchThresh * 0.5f || (now - pulseStartTime) > 220L)) {
             isPulseActive = false
             val pulseDuration = now - pulseStartTime
 
-            if (pulseDuration < 105L) {
-                // Check physical debounce lockout:
+            if (pulseDuration < MAX_PINCH_PULSE_MS) {
                 val timeSinceLastPinch = now - lastPinchAcceptedTime
                 if (timeSinceLastPinch < MIN_INTER_PINCH_INTERVAL_MS) {
-                    // Suppress flesh/strap recoil ringing oscillation!
-                    Log.d(TAG, "Suppressed recoil bounce: $timeSinceLastPinch ms < $MIN_INTER_PINCH_INTERVAL_MS ms")
+                    Log.d(TAG, "Suppressed recoil bounce: $timeSinceLastPinch ms")
                     return
                 }
                 lastPinchAcceptedTime = now
@@ -333,12 +594,13 @@ class GestureEngine(
     }
 
     /**
-     * Multi-Pinch Dispatcher with Ground-Truth Inspection
+     * Multi-Pinch Dispatcher with Ground-Truth Inspection. Runs on the sensor thread.
      */
     private fun onPinchDetected(now: Long, peak: Float, duration: Long) {
+        val handler = sensorHandler ?: return
         val phase = classifier.trainingPhase.value
 
-        // Guided 25-Trial Training: Phase 1 (Single Pinch)
+        // Guided Training: Phase 1 (Single Pinch)
         if (phase == TrainingPhase.TRAINING_SINGLE_PINCH) {
             hapticManager.vibrateClick()
             val snapshot = classifier.getRecentWaveformSnapshot()
@@ -349,109 +611,93 @@ class GestureEngine(
         }
 
         pinchCounter++
-        pendingPinchJob?.cancel()
+        handler.removeCallbacks(resolvePinchRunnable)
+        handler.removeCallbacks(resetTrainingCounterRunnable)
         hapticManager.vibrateClick()
 
         val interval = if (lastSinglePinchTime > 0) now - lastSinglePinchTime else 220L
         lastSinglePinchTime = now
+        if (pinchCounter == 1) firstPinchPeak = peak
 
-        // Guided 25-Trial Training: Phase 2 (Double Pinch)
+        // Guided Training: Phase 2 (Double Pinch)
         if (phase == TrainingPhase.TRAINING_DOUBLE_PINCH) {
             if (pinchCounter == 2) {
                 pinchCounter = 0
-                pendingPinchJob?.cancel()
                 val snapshot = classifier.getRecentWaveformSnapshot()
                 udpClient.sendPacket(ControlPacket.WaveformEvent("Double Pinch", 2, peak, interval, snapshot))
                 val done = classifier.recordDoublePinchTrial(interval)
                 if (done) hapticManager.vibrateDoubleFistRightClick()
             } else {
-                pendingPinchJob = scope.launch(Dispatchers.Main) {
-                    delay(500)
-                    pinchCounter = 0
-                }
+                handler.postDelayed(resetTrainingCounterRunnable, 600)
             }
             return
         }
 
-        // Guided 25-Trial Training: Phase 3 (Triple Pinch)
+        // Guided Training: Phase 3 (Triple Pinch)
         if (phase == TrainingPhase.TRAINING_TRIPLE_PINCH) {
             if (pinchCounter == 3) {
                 pinchCounter = 0
-                pendingPinchJob?.cancel()
                 val snapshot = classifier.getRecentWaveformSnapshot()
                 udpClient.sendPacket(ControlPacket.WaveformEvent("Triple Pinch", 3, peak, interval, snapshot))
                 val done = classifier.recordTriplePinchTrial(interval)
                 if (done) {
-                    val recThresh = classifier.getRecommendedThreshold()
-                    appSettings.setPinchThreshold(recThresh)
+                    appSettings.setPinchThreshold(classifier.getRecommendedThreshold())
+                    appSettings.setMultiTapWindowMs(classifier.getRecommendedMultiTapWindow())
                     hapticManager.vibrateHoldEnd()
                 }
             } else {
-                pendingPinchJob = scope.launch(Dispatchers.Main) {
-                    delay(500)
-                    pinchCounter = 0
-                }
+                handler.postDelayed(resetTrainingCounterRunnable, 600)
             }
             return
         }
+
+        // Keep the cursor pinned for the whole multi-pinch sequence so the click lands on target
+        val window = appSettings.multiTapWindowMs.value
+        freezeCursorMotion(window + 120L)
 
         // Operational Mode: Immediate Triple Pinch -> RIGHT CLICK
         if (pinchCounter >= 3) {
             pinchCounter = 0
-            pendingPinchJob?.cancel()
-            pendingPinchJob = null
-
-            lastReviewedGesture.value = "Triple Pinch -> Right Click"
-            lastReviewedCount.value = 3
-            lastReviewedPeak.value = peak
-            lastReviewedInterval.value = interval
-            isReviewReady.value = true
-
-            val snapshot = classifier.getRecentWaveformSnapshot()
-            udpClient.sendPacket(ControlPacket.GestureReview("Triple Pinch (Right Click)", 3, peak, interval))
-            udpClient.sendPacket(ControlPacket.WaveformEvent("Triple Pinch", 3, peak, interval, snapshot))
+            publishReview("Triple Pinch -> Right Click", 3, peak, interval)
             triggerDoublePinchRightClick()
             return
         }
 
-        // Multi-Pinch Window Timer
-        pendingPinchJob = scope.launch(Dispatchers.Main) {
-            delay(MULTI_PINCH_WINDOW_MS)
-            val count = pinchCounter
-            pinchCounter = 0
-            pendingPinchJob = null
+        // Wait to see whether more pinches follow
+        lastReviewedPeak.value = peak
+        lastReviewedInterval.value = interval
+        handler.postDelayed(resolvePinchRunnable, window)
+    }
 
-            val gName = when (count) {
-                1 -> "Single Pinch (Ignored)"
-                2 -> "Double Pinch -> Left Click"
-                else -> "Triple Pinch -> Right Click"
-            }
+    private fun resolveMultiPinch() {
+        val count = pinchCounter
+        pinchCounter = 0
+        if (count == 0) return
 
-            lastReviewedGesture.value = gName
-            lastReviewedCount.value = count
-            lastReviewedPeak.value = peak
-            lastReviewedInterval.value = interval
-            isReviewReady.value = true
-
-            val snapshot = classifier.getRecentWaveformSnapshot()
-            udpClient.sendPacket(ControlPacket.GestureReview(gName, count, peak, interval))
-            udpClient.sendPacket(ControlPacket.WaveformEvent(gName, count, peak, interval, snapshot))
-
-            when (count) {
-                1 -> {
-                    // User requested: "forget about single click it is messing us some times"
-                    Log.i(TAG, "Single pinch ignored (no click dispatched).")
-                }
-                2 -> {
-                    // User requested: "double click means left click"
-                    triggerPinchLeftClick()
-                }
-                else -> {
-                    // User requested: "tripal click means right click"
-                    triggerDoublePinchRightClick()
-                }
-            }
+        val gName = when (count) {
+            1 -> "Single Pinch (Ignored)"
+            2 -> "Double Pinch -> Left Click"
+            else -> "Triple Pinch -> Right Click"
         }
+        publishReview(gName, count, maxOf(firstPinchPeak, lastReviewedPeak.value), lastReviewedInterval.value)
+
+        when (count) {
+            1 -> Log.i(TAG, "Single pinch ignored (no click dispatched).")
+            2 -> triggerPinchLeftClick()
+            else -> triggerDoublePinchRightClick()
+        }
+    }
+
+    private fun publishReview(name: String, count: Int, peak: Float, interval: Long) {
+        lastReviewedGesture.value = name
+        lastReviewedCount.value = count
+        lastReviewedPeak.value = peak
+        lastReviewedInterval.value = interval
+        isReviewReady.value = true
+
+        val snapshot = classifier.getRecentWaveformSnapshot()
+        udpClient.sendPacket(ControlPacket.GestureReview(name, count, peak, interval))
+        udpClient.sendPacket(ControlPacket.WaveformEvent(name, count, peak, interval, snapshot))
     }
 
     /**
@@ -461,14 +707,14 @@ class GestureEngine(
         val detected = lastReviewedCount.value
         Log.i(TAG, "User Review Feedback: actual=$actualCount, detected=$detected")
 
-        if (actualCount == 1 && detected >= 2) {
-            // User did 1 pinch, but watch saw 2 -> recoil issue, slightly raise threshold
+        if (actualCount < detected) {
+            // Watch saw more pinches than were made -> recoil / noise, raise threshold slightly
             val cur = appSettings.pinchThreshold.value
             appSettings.setPinchThreshold((cur + 0.3f).coerceAtMost(6.0f))
-        } else if (actualCount >= 2 && detected == 1) {
-            // User did double pinch, but watch only saw 1 -> slightly lower threshold
+        } else if (actualCount > detected) {
+            // Watch missed a pinch -> lower threshold slightly
             val cur = appSettings.pinchThreshold.value
-            appSettings.setPinchThreshold((cur - 0.25f).coerceAtLeast(2.0f))
+            appSettings.setPinchThreshold((cur - 0.25f).coerceAtLeast(1.5f))
         }
 
         hapticManager.vibrateClick()
@@ -479,71 +725,9 @@ class GestureEngine(
         isReviewReady.value = false
     }
 
-    /**
-     * Rotation vector handler (3D Roll Scroll)
-     */
-    private fun handleRotationVector(event: SensorEvent) {
-        if (!appSettings.wristRollScrollEnabled.value) {
-            if (_activeGesture.value == ActiveGesture.WRIST_ROLL_SCROLLING) {
-                _activeGesture.value = ActiveGesture.NONE
-            }
-            return
-        }
-
-        val rotationMatrix = FloatArray(9)
-        val orientation = FloatArray(3)
-
-        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-        SensorManager.getOrientation(rotationMatrix, orientation)
-
-        val rollDeg = Math.toDegrees(orientation[2].toDouble()).toFloat()
-        currentRollAngle = rollDeg
-
-        if (!isRollCalibrated) {
-            calibratedRollAngle = rollDeg
-            isRollCalibrated = true
-        }
-
-        val deltaRoll = currentRollAngle - calibratedRollAngle
-        val now = SystemClock.uptimeMillis()
-
-        // Re-center neutral baseline when arm is resting near center
-        if (abs(deltaRoll) <= 8.0f) {
-            calibratedRollAngle = calibratedRollAngle * 0.96f + currentRollAngle * 0.04f
-            if (_activeGesture.value == ActiveGesture.WRIST_ROLL_SCROLLING) {
-                _activeGesture.value = ActiveGesture.NONE
-            }
-            return
-        }
-
-        if (abs(deltaRoll) > WRIST_ROLL_DEADZONE_DEG) {
-            if (now - lastScrollSentTime >= 40) {
-                lastScrollSentTime = now
-
-                // User: "clockwise arme twist down and anticloke side anr twist up"
-                // deltaRoll > 0 (clockwise): scroll DOWN (negative scrollY)
-                // deltaRoll < 0 (anti-clockwise): scroll UP (positive scrollY)
-                val scrollY = if (deltaRoll > 0) {
-                    val excess = deltaRoll - WRIST_ROLL_DEADZONE_DEG
-                    -(excess * 3.8f).coerceAtLeast(-90.0f)
-                } else {
-                    val excess = -deltaRoll - WRIST_ROLL_DEADZONE_DEG
-                    (excess * 3.8f).coerceAtMost(90.0f)
-                }
-
-                _activeGesture.value = ActiveGesture.WRIST_ROLL_SCROLLING
-                udpClient.sendPacket(ControlPacket.Scroll(scrollX = 0.0f, scrollY = scrollY))
-                if (bleHidManager.isConnected.value) {
-                    val wheel = if (scrollY > 0) 1.toByte() else (-1).toByte()
-                    bleHidManager.sendScroll(wheel)
-                }
-            }
-        } else {
-            if (_activeGesture.value == ActiveGesture.WRIST_ROLL_SCROLLING) {
-                _activeGesture.value = ActiveGesture.NONE
-            }
-        }
-    }
+    // =====================================================================
+    // Bezel & actions
+    // =====================================================================
 
     /**
      * Hardware Bezel rotation handler
@@ -557,7 +741,7 @@ class GestureEngine(
         val scrollAmount = -delta * 40.0f
         udpClient.sendPacket(ControlPacket.Scroll(scrollX = 0.0f, scrollY = scrollAmount))
 
-        if (bleHidManager.isConnected.value) {
+        if (bleActive()) {
             val wheel = (-delta * 2).toInt().coerceIn(-127, 127).toByte()
             bleHidManager.sendScroll(wheel)
         }
@@ -571,17 +755,17 @@ class GestureEngine(
     }
 
     fun triggerPinchLeftClick() {
-        freezeCursorMotion(280L)
+        freezeCursorMotion(200L)
         _activeGesture.value = ActiveGesture.PINCH_LEFT_CLICK
 
         if (appSettings.gestureClicksEnabled.value) {
             udpClient.sendPacket(ControlPacket.Click(button = "left", action = "click"))
-            if (bleHidManager.isConnected.value) {
+            if (bleActive()) {
                 bleHidManager.sendLeftClick()
             }
-            Log.i(TAG, "Gesture: PINCH -> Left Click")
+            Log.i(TAG, "Gesture: DOUBLE PINCH -> Left Click")
         } else {
-            Log.i(TAG, "Gesture Test: PINCH -> Left Click (Clicks disabled)")
+            Log.i(TAG, "Gesture Test: DOUBLE PINCH -> Left Click (Clicks disabled)")
         }
 
         scope.launch(Dispatchers.Main) {
@@ -593,18 +777,18 @@ class GestureEngine(
     }
 
     fun triggerDoublePinchRightClick() {
-        freezeCursorMotion(320L)
+        freezeCursorMotion(250L)
         _activeGesture.value = ActiveGesture.DOUBLE_PINCH_RIGHT_CLICK
         hapticManager.vibrateDoubleFistRightClick()
 
         if (appSettings.gestureClicksEnabled.value) {
             udpClient.sendPacket(ControlPacket.Click(button = "right", action = "click"))
-            if (bleHidManager.isConnected.value) {
+            if (bleActive()) {
                 bleHidManager.sendRightClick()
             }
-            Log.i(TAG, "Gesture: DOUBLE PINCH -> Right Click")
+            Log.i(TAG, "Gesture: TRIPLE PINCH -> Right Click")
         } else {
-            Log.i(TAG, "Gesture Test: DOUBLE PINCH -> Right Click (Clicks disabled)")
+            Log.i(TAG, "Gesture Test: TRIPLE PINCH -> Right Click (Clicks disabled)")
         }
 
         scope.launch(Dispatchers.Main) {
@@ -620,6 +804,7 @@ class GestureEngine(
         toggleSelection(isTriplePinch = true)
     }
 
+    @Synchronized
     fun toggleSelection(isTriplePinch: Boolean = false) {
         if (isSelecting) {
             endSelection(isTriplePinch)
@@ -636,7 +821,7 @@ class GestureEngine(
 
         if (appSettings.gestureClicksEnabled.value) {
             udpClient.sendPacket(ControlPacket.Click(button = "left", action = "down"))
-            if (bleHidManager.isConnected.value) {
+            if (bleActive()) {
                 bleHidManager.startDrag()
             }
             Log.i(TAG, "Gesture: Selection Started (Mouse Down)")
@@ -656,13 +841,12 @@ class GestureEngine(
         _activeGesture.value = if (isTriplePinch) ActiveGesture.TRIPLE_PINCH_SELECTION else ActiveGesture.FIST_SELECTION_ENDED
         hapticManager.vibrateHoldEnd()
 
-        if (appSettings.gestureClicksEnabled.value) {
-            udpClient.sendPacket(ControlPacket.Click(button = "left", action = "up"))
-            if (bleHidManager.isConnected.value) {
-                bleHidManager.endDrag()
-            }
-            Log.i(TAG, "Gesture: Selection Ended (Mouse Up)")
+        // Always release, even in test mode, so a button can never stay stuck down
+        udpClient.sendPacket(ControlPacket.Click(button = "left", action = "up"))
+        if (bleActive()) {
+            bleHidManager.endDrag()
         }
+        Log.i(TAG, "Gesture: Selection Ended (Mouse Up)")
 
         scope.launch(Dispatchers.Main) {
             delay(350)
@@ -676,5 +860,8 @@ class GestureEngine(
         freezeCursorMotion(250L)
         hapticManager.vibrateClick()
         udpClient.sendPacket(ControlPacket.Click(button = button, action = "click"))
+        if (bleActive()) {
+            if (button == "right") bleHidManager.sendRightClick() else bleHidManager.sendLeftClick()
+        }
     }
 }

@@ -1,2 +1,4 @@
-pynput>=1.7.6
+# The controller itself only needs the Python standard library.
+# Optional: install these to enable the ML studio on http://localhost:8766
+numpy>=1.24
 torch>=2.0.0

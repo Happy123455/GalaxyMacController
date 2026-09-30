@@ -22,9 +22,40 @@ class AppSettings(context: Context) {
     val horizontalSensitivity = MutableStateFlow(prefs.getFloat(KEY_HORIZ_SENS, 1.0f))
     val verticalSensitivity = MutableStateFlow(prefs.getFloat(KEY_VERT_SENS, 1.0f))
 
+    // Keeps pointing accurate when the wrist is rotated (uses the gravity sensor)
+    val tiltCompensation = MutableStateFlow(prefs.getBoolean(KEY_TILT_COMP, true))
+    val invertRollScroll = MutableStateFlow(prefs.getBoolean(KEY_INVERT_ROLL, false))
+
+    // Time allowed between pinches of a double / triple pinch (learned by ML training)
+    val multiTapWindowMs = MutableStateFlow(prefs.getLong(KEY_MULTI_TAP_WINDOW, 380L))
+
+    // Last Mac that answered, tried directly when broadcast discovery is blocked
+    val lastServerIp = MutableStateFlow(prefs.getString(KEY_LAST_SERVER_IP, null))
+
     fun setGestureClicksEnabled(enabled: Boolean) {
         gestureClicksEnabled.value = enabled
         prefs.edit().putBoolean(KEY_GESTURE_CLICKS, enabled).apply()
+    }
+
+    fun setTiltCompensation(enabled: Boolean) {
+        tiltCompensation.value = enabled
+        prefs.edit().putBoolean(KEY_TILT_COMP, enabled).apply()
+    }
+
+    fun setInvertRollScroll(enabled: Boolean) {
+        invertRollScroll.value = enabled
+        prefs.edit().putBoolean(KEY_INVERT_ROLL, enabled).apply()
+    }
+
+    fun setMultiTapWindowMs(windowMs: Long) {
+        multiTapWindowMs.value = windowMs
+        prefs.edit().putLong(KEY_MULTI_TAP_WINDOW, windowMs).apply()
+    }
+
+    fun setLastServerIp(ip: String) {
+        if (lastServerIp.value == ip) return
+        lastServerIp.value = ip
+        prefs.edit().putString(KEY_LAST_SERVER_IP, ip).apply()
     }
 
     fun setVibrationEnabled(enabled: Boolean) {
@@ -114,5 +145,9 @@ class AppSettings(context: Context) {
         private const val KEY_AIMING_SPEED = "pref_aiming_speed"
         private const val KEY_HORIZ_SENS = "pref_horiz_sens"
         private const val KEY_VERT_SENS = "pref_vert_sens"
+        private const val KEY_TILT_COMP = "pref_tilt_comp"
+        private const val KEY_INVERT_ROLL = "pref_invert_roll"
+        private const val KEY_MULTI_TAP_WINDOW = "pref_multi_tap_window"
+        private const val KEY_LAST_SERVER_IP = "pref_last_server_ip"
     }
 }
